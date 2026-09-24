@@ -1,0 +1,75 @@
+name: Daily insider scan
+
+on:
+  schedule:
+    - cron: "0 16 * * 1-5"   # 21:30 IST, Monday to Friday (GitHub cron runs in UTC)
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Only send a test Telegram message (no scan)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Kolkata
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Send a test Telegram message
+        if: ${{ inputs.test_alert }}
+        run: python app/daily_scan.py --telegram-test
+
+      - name: Scan NSE
+        if: ${{ !inputs.test_alert }}
+        run: python app/daily_scan.py --out site --alerts-file alerts.json
+
+      - uses: actions/configure-pages@v5
+        if: ${{ !inputs.test_alert }}
+
+      - uses: actions/upload-pages-artifact@v3
+        if: ${{ !inputs.test_alert }}
+        with:
+          path: site
+
+      - name: Publish the page
+        id: deploy
+        if: ${{ !inputs.test_alert }}
+        uses: actions/deploy-pages@v4
+
+      # Alerts go out only after the page is live, so the link in the message works
+      # and a failed publish is re-alerted on the next run.
+      - name: Send Telegram alerts
+        if: ${{ !inputs.test_alert }}
+        run: python app/daily_scan.py --send-alerts alerts.json
+
+      - name: Tell Telegram the run failed
+        if: ${{ failure() && !inputs.test_alert }}
+        run: python app/daily_scan.py --notify-failure
