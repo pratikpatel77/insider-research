@@ -159,7 +159,17 @@ def scan(out_dir, alerts_file):
             print(f"{int(pct):3d}%  {msg}", flush=True)
             last[0] = time.time()
 
-    res = engine.run_scan(progress, nse_live.PriceCache(), nse_live.FilingCache())
+    filings = nse_live.FilingCache()
+    try:
+        res = engine.run_scan(progress, nse_live.PriceCache(), filings)
+    except nse_live.DownloadBlocked as e:
+        filings.save()
+        open("scan_status.txt", "w", encoding="utf-8").write(str(e))
+        raise
+    except BaseException:
+        filings.save()               # keep what was downloaded so the next run starts further along
+        raise
+    filings.save(prune=True)         # success: drop filings that have aged out of the window
     meta = res["meta"]
     print(f"Scan done in {meta['seconds']}s: {len(res['signals'])} on watch, {meta['filings']:,} filings, prices to {meta['as_of']}.")
     check_fresh(meta)
@@ -195,7 +205,9 @@ def main():
         return 0 if send_telegram(["<b>Test from Insider Screener.</b>\nTelegram alerts are working. You'll get a message here when a stock is added, gets a fresh insider buy, or needs an exit check."]) else 1
     if a.notify_failure:
         run = "{}/{}/actions/runs/{}".format(os.environ.get("GITHUB_SERVER_URL", "https://github.com"), os.environ.get("GITHUB_REPOSITORY", ""), os.environ.get("GITHUB_RUN_ID", ""))
-        send_telegram([f"<b>Insider scan failed.</b>\nToday's watchlist was not updated; the last good one is still online.\nDetails: {run}"])
+        why = open("scan_status.txt", encoding="utf-8").read().strip() if os.path.exists("scan_status.txt") else ""
+        note = f"\n{esc(why)}" if why else ""
+        send_telegram([f"<b>Insider scan failed.</b>\nToday's watchlist was not updated; the last good one is still online.{note}\nDetails: {run}"])
         return 0
     if a.send_alerts:
         msgs = json.load(open(a.send_alerts))

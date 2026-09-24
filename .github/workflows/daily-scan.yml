@@ -25,7 +25,7 @@ env:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -47,9 +47,35 @@ jobs:
         if: ${{ inputs.test_alert }}
         run: python app/daily_scan.py --telegram-test
 
+      # Published filings never change, so they are kept between runs: only the first run downloads them all.
+      - name: Restore saved filings
+        if: ${{ !inputs.test_alert }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .nse-cache
+          key: nse-filings-none
+          restore-keys: nse-filings-
+
+      # First run ever (or the saved copy expired): start from the filings bundled in the repo.
+      - name: Start from the bundled filings if none were restored
+        if: ${{ !inputs.test_alert }}
+        run: |
+          mkdir -p .nse-cache
+          [ -f .nse-cache/filings.json.gz ] || cp data/filings-seed.json.gz .nse-cache/filings.json.gz
+
       - name: Scan NSE
         if: ${{ !inputs.test_alert }}
+        env:
+          NSE_CACHE_DIR: .nse-cache
+          NSE_WORKERS: "8"
         run: python app/daily_scan.py --out site --alerts-file alerts.json
+
+      - name: Save filings for next time
+        if: ${{ always() && !inputs.test_alert }}
+        uses: actions/cache/save@v4
+        with:
+          path: .nse-cache
+          key: nse-filings-${{ github.run_id }}
 
       - uses: actions/configure-pages@v5
         if: ${{ !inputs.test_alert }}

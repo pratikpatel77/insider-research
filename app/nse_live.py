@@ -1,5 +1,5 @@
 """Live data access to official NSE sources. Everything is kept in memory; nothing is written to disk."""
-import calendar, datetime as dt, io, re, time, zipfile
+import calendar, datetime as dt, gzip, io, json, os, re, time, zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
@@ -39,10 +39,14 @@ class NSE:
         raise RuntimeError(f"NSE did not respond for {path.split('?')[0]}. Check your internet connection and try again.")
 
 
-def _get(url, tries=4):
+class DownloadBlocked(RuntimeError):
+    """NSE stopped answering (rate limit or IP block). Progress is saved; run again later to continue."""
+
+
+def _get(url, tries=4, timeout=40):
     for k in range(tries):
         try:
-            r = requests.get(url, headers={"User-Agent": UA}, timeout=40)
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
             if r.status_code == 200:
                 return r.content
             if r.status_code == 404:
@@ -187,8 +191,31 @@ def parse_pit_xml(txt):
 class FilingCache:
     """Insider (PIT Reg 7(2)) filings from NSE's legacy JSON feed and its newer XBRL filings, in memory."""
 
-    def __init__(self):
+    def __init__(self, cache_dir=None):
         self.legacy_months, self.xml = {}, {}
+        # Optional on-disk cache (set NSE_CACHE_DIR). Used by the GitHub Actions scan, where every run
+        # starts on an empty machine: a published filing never changes, so it is downloaded only once.
+        self.cache_dir = cache_dir or os.environ.get("NSE_CACHE_DIR")
+        self._path = os.path.join(self.cache_dir, "filings.json.gz") if self.cache_dir else None
+        self._wanted = set()
+        if self._path and os.path.exists(self._path):
+            try:
+                with gzip.open(self._path, "rt", encoding="utf-8") as f:
+                    self.xml = json.load(f)
+                print(f"Loaded {len(self.xml)} filings from the cache.", flush=True)
+            except (OSError, ValueError):
+                self.xml = {}
+
+    def save(self, prune=False):
+        """Write the filing cache to disk. prune=True drops filings this run no longer needs."""
+        if not self._path:
+            return
+        os.makedirs(self.cache_dir, exist_ok=True)
+        keep = {u: t for u, t in self.xml.items() if u in self._wanted} if prune else self.xml
+        tmp = self._path + ".tmp"
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            json.dump(keep, f)
+        os.replace(tmp, self._path)
 
     def legacy(self, nse, start, end, progress):
         rows = []
@@ -212,21 +239,35 @@ class FilingCache:
             time.sleep(0.5)
         return pd.DataFrame(lst).drop_duplicates("xmlFileName") if lst else pd.DataFrame()
 
-    def details(self, lst, progress, base=10, span=10):
+    def details(self, lst, progress, base=10, span=10, max_fails=40):
+        self._wanted.update(lst.xmlFileName)
         urls = [u for u in lst.xmlFileName if u not in self.xml]
 
         def dl(u):
-            b = _get(u)
+            b = _get(u, tries=2, timeout=20)
             return u, (b.decode("utf-8", errors="ignore") if b else None)
 
-        done = 0
-        with ThreadPoolExecutor(10) as ex:
+        done = fails = 0
+        ex = ThreadPoolExecutor(int(os.environ.get("NSE_WORKERS", 10)))
+        try:
             for u, t in ex.map(dl, urls):
                 if t is not None:
                     self.xml[u] = t
+                    fails = 0
+                else:
+                    fails += 1
                 done += 1
                 if done % 100 == 0:
                     progress(f"Reading insider filing details ({done}/{len(urls)})", base + span * done / max(1, len(urls)))
+                if done % 300 == 0:
+                    self.save()   # keep progress even if the run is cut off part-way
+                if fails >= max_fails:
+                    self.save()
+                    missing = sum(1 for x in urls if x not in self.xml)
+                    raise DownloadBlocked(f"NSE stopped answering after {len(self.xml)} filings were saved; {missing} are still missing. "
+                                          "Run the workflow again to continue from where it stopped.")
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
         rows = []
         for r in lst.itertuples(index=False):
             t = self.xml.get(r.xmlFileName)
