@@ -145,6 +145,9 @@ def send_telegram(messages):
 
 # ---------------------------------------------------------------- scan
 def check_fresh(meta):
+    as_of = dt.datetime.strptime(meta["as_of"], "%d %b %Y")
+    if (dt.datetime.now() - as_of).days > 5:
+        raise RuntimeError(f"The newest NSE price file loaded is for {meta['as_of']}, so recent price downloads were blocked. Nothing was published.")
     latest = dt.datetime.strptime(meta["latest_filing"], "%d %b %Y, %H:%M")
     age = (dt.datetime.now() - latest).days
     if age > MAX_STALE_DAYS:

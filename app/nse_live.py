@@ -43,11 +43,12 @@ class DownloadBlocked(RuntimeError):
     """NSE stopped answering (rate limit or IP block). Progress is saved; run again later to continue."""
 
 
-def _get(url, tries=4, timeout=40):
+def _get(url, tries=4, timeout=40, zipped=False):
     for k in range(tries):
         try:
             r = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
-            if r.status_code == 200:
+            # NSE sometimes answers 200 with an HTML error page when it throttles a client: treat that as a failure and retry
+            if r.status_code == 200 and (not zipped or r.content[:2] == b"PK"):
                 return r.content
             if r.status_code == 404:
                 return None
@@ -76,11 +77,14 @@ class PriceCache:
         self.px, self.bh, self.mcap = {}, {}, None
 
     def _bhav(self, d):
-        b = _get(f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{d:%Y%m%d}_F_0000.csv.zip")
+        b = _get(f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{d:%Y%m%d}_F_0000.csv.zip", tries=6, zipped=True)
         if not b:
             return None
-        z = zipfile.ZipFile(io.BytesIO(b))
-        df = pd.read_csv(z.open(z.namelist()[0]))
+        try:
+            z = zipfile.ZipFile(io.BytesIO(b))
+            df = pd.read_csv(z.open(z.namelist()[0]))
+        except (zipfile.BadZipFile, KeyError, ValueError):
+            return None
         df = df[(df.FinInstrmTp == "STK") & df.SctySrs.isin(EQ_SERIES) & ~df.ISIN.astype(str).str.startswith("INF")]
         df = df.rename(columns={"TckrSymb": "sym", "SctySrs": "ser", "OpnPric": "o", "HghPric": "h", "LwPric": "l",
                                 "ClsPric": "c", "PrvsClsgPric": "pc", "TtlTrfVal": "val"})[["sym", "ser", "o", "h", "l", "c", "pc", "val"]]
@@ -90,7 +94,7 @@ class PriceCache:
         return df
 
     def _pr(self, d):
-        b = _get(f"https://nsearchives.nseindia.com/archives/equities/bhavcopy/pr/PR{d:%d%m%y}.zip")
+        b = _get(f"https://nsearchives.nseindia.com/archives/equities/bhavcopy/pr/PR{d:%d%m%y}.zip", tries=6, zipped=True)
         out = {}
         if not b:
             return out
